@@ -19,20 +19,27 @@ def flatten(args):
     except TypeError:
         return (args, )
 
-Params = namedtuple('Params', ['w1', 'b1', 'w2', 'b2', 'w3', 'b3'])
+#Params = namedtuple('Params', ['w1', 'b1', 'w2', 'b2', 'w3', 'b3'])
 
 def setup_params(rng):
     
-    obs, info = env.reset()
-    obs = jnp.asarray(flatten(obs))
-    params = Params(
-        w1 = random.normal(rng, (jnp.size(obs), 16)),
-        b1 = random.normal(rng, (16,)),
-        w2 = random.normal(rng, (16, 16)),
-        b2 = random.normal(rng, (16,)),
-        w3 = random.normal(rng, (16, 3)),
-        b3 = random.normal(rng, (3,))
-    )
+    #params = Params(
+    #    w1 = random.normal(rng, (jnp.size(obs), 16)),
+    #    b1 = random.normal(rng, (16,)),
+    #    w2 = random.normal(rng, (16, 16)),
+    #    b2 = random.normal(rng, (16,)),
+    #    w3 = random.normal(rng, (16, 3)),
+    #    b3 = random.normal(rng, (3,))
+    #)
+    
+    w1 = random.normal(rng, (16393, 16)) * 0.1
+    b1 = random.normal(rng, (16,)) * 0.1
+    w2 = random.normal(rng, (16, 16)) * 0.1
+    b2 = random.normal(rng, (16,)) * 0.1
+    w3 = random.normal(rng, (16, 3)) * 0.1
+    b3 = random.normal(rng, (3,)) * 0.1
+    
+    params = w1, b1, w2, b2, w3, b3
     return params
 
     
@@ -40,11 +47,13 @@ def setup_params(rng):
 # representing: (speed, 4 last LIDARs, 2 previous actions)
 # actions are [gas, break, steer], analog between -1.0 and +1.0
 def model(params, x_data):
-    z = x_data @ params.w1 + params.b1
+    w1, b1, w2, b2, w3, b3 = params
+    z = jnp.dot(x_data, w1) + b1
     z = nn.relu(z)
-    z = z @ params.w2 + params.b2
+    z = jnp.dot(z, w2) + b2
     z = nn.relu(z)
-    z = z @ params.w3 + params.b3
+    z = jnp.dot(z, w3) + b3
+    z = jnp.tanh(z)
     return z
 
 def policy(params, obs):
@@ -73,11 +82,11 @@ def update_params(params, obs, action, reward, next_obs, done, learning_rate):
 # Let us retrieve the TMRL Gymnasium environment.
 # The environment you get from get_environment() depends on the content of config.json
 env = get_environment()
+sleep(1.0)  # just so we have time to focus the TM20 window after starting the script
 rng = random.PRNGKey(0)
 params = setup_params(rng)
 learning_rate = 0.01
 
-sleep(1.0)  # just so we have time to focus the TM20 window after starting the script
 
 
 for _ in range(10):  # rtgym ensures this runs at 20Hz by default
