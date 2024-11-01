@@ -7,6 +7,9 @@ import jax.numpy as jnp
 from collections import namedtuple
 import numpy as np
 
+import gymnasium as gym
+from gymnasium import spaces
+
 # %% Setup params
 
 def flatten(args):
@@ -78,6 +81,38 @@ def update_params(params, obs, action, reward, next_obs, done, learning_rate):
 
     return params
 
+
+#%% Create a custom observation space for our data from the game (HIGHLY EXPERIMENTAL)
+custom_observation_space = spaces.Box(
+    low = np.array([[-100, -100, -100],
+                     [0, 0, 0]]),
+    high = np.array([[100, 100, 100],
+                     [359, 359, 359]]),
+    shape= (2,  #position
+            3),
+    dtype= np.float32
+)
+
+custom_observation_space.sample()
+
+# TESTING HOW THE ACTION SPACE WORKS
+def custom_policy(timestep_count):
+    rng = random.PRNGKey(timestep_count)
+    # Create a random steering angle from -1 to 1
+    steering = random.uniform(rng, minval=-1.0, maxval=1.0)
+    print(steering)
+    # if(timestep_count%3 == 0):
+    #     steering = 0.0
+    # elif(timestep_count%3 == 1):
+    #     steering = -0.5
+    # else:
+    #     steering = 1.0
+
+    return jnp.array([1.0, 0.0, steering])
+
+
+
+
 # %%
 # Let us retrieve the TMRL Gymnasium environment.
 # The environment you get from get_environment() depends on the content of config.json
@@ -89,15 +124,22 @@ learning_rate = 0.01
 
 
 
+
+
+
 for _ in range(10):  # rtgym ensures this runs at 20Hz by default
     obs, info = env.reset()  # reset environment
+    print(obs)
     obs = jnp.asarray(flatten(obs))
     terminated, truncated = False, False
+    counter = 0
     while not (terminated | truncated):
         act = policy(params, obs)  # compute action
         next_obs, rew, terminated, truncated, info = env.step(act)  # step (rtgym ensures healthy time-steps)
         next_obs = jnp.asarray(flatten(next_obs))
         params = update_params(params, obs, act, rew, next_obs, (terminated | truncated), learning_rate)
         obs = next_obs
+
+        counter+=1
 
 # %%
