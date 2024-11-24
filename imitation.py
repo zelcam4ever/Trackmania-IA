@@ -1,141 +1,152 @@
-# %%
-# Load data
-
-import jax.numpy as jnp
-import json
-
-def load_recording(filename):
-    with open(filename, 'r') as file:
-        data = json.load(file)
-    return [(jnp.array(item['obs']), jnp.array(item['act'])) for item in data]
-
-# Load data
-recording = load_recording("recording.txt")
-
-# Prepare training data
-observations = jnp.stack([obs for obs, act in recording])
-actions = jnp.stack([act for obs, act in recording])
-
-
-# %%
-# Define the neural network model
-
-import jax
-from jax import random, nn
-
-# Initialize parameters
-def initialize_model_params(rng, input_dim, hidden_dim, output_dim):
-    w1 = random.normal(rng, (input_dim, hidden_dim)) * 0.01
-    b1 = jnp.zeros((hidden_dim,))
-    w2 = random.normal(rng, (hidden_dim, hidden_dim)) * 0.01
-    b2 = jnp.zeros((hidden_dim,))
-    w3 = random.normal(rng, (hidden_dim, output_dim)) * 0.01
-    b3 = jnp.zeros((output_dim,))
-    return w1, b1, w2, b2, w3, b3
-
-def imitation_model(params, x):
-    w1, b1, w2, b2, w3, b3 = params
-    z1 = nn.relu(jnp.dot(x, w1) + b1)
-    z2 = nn.relu(jnp.dot(z1, w2) + b2)
-    z3 = jnp.dot(z2, w3) + b3  # Raw outputs from the model
-
-
-    gas = jnp.clip(z3[0], 0.0, 1.0)
-    brake = jnp.clip(z3[1], 0.0, 1.0)
-    steering = jnp.clip(z3[2], -1.0, 1.0)
-    z = jnp.stack([gas, brake, steering], axis=-1)
-    """x = x.at[idx].set(y)"""
-
-    # Assuming the model output has three components for each action: gas, brake, steering
-    # print(f"z3 before at [0]: {z3[..., 0]}")
-    # z3 = z3.at[..., 0].set(jnp.clip(z3[..., 0], 0.0, 1.0))  # Clamp gas between 0 and 1
-    # print(f"z3 after at [0]: {z3[..., 0]}")
-    # z3 = z3.at[..., 1].set(jnp.clip(z3[..., 1], 0.0, 1.0))  # Clamp brake between 0 and 1
-    # z3 = z3.at[..., 2].set(jnp.clip(z3[..., 2], -1.0, 1.0)) # Clamp steering between -1 and 1
-
-    return z
-
-# %%
-# Define the loss function
-def mse_loss(params, model, x, y):
-    preds = model(params, x)
-    return jnp.mean(jnp.square(preds - y))
-
-# %%
-# Define the training step
-import optax
-
-# Hyperparameters
-learning_rate = 0.001
-batch_size = 32
-epochs = 100
-
-# Initialize model
-rng = random.PRNGKey(0)
-input_dim = observations.shape[1]
-hidden_dim = 64
-output_dim = actions.shape[1]
-params = initialize_model_params(rng, input_dim, hidden_dim, output_dim)
-
-# Optimizer
-optimizer = optax.adam(learning_rate)
-opt_state = optimizer.init(params)
-
-@jax.jit
-def train_step(params, opt_state, batch_obs, batch_act):
-    loss, grads = jax.value_and_grad(mse_loss)(params, imitation_model, batch_obs, batch_act)
-    updates, opt_state = optimizer.update(grads, opt_state)
-    params = optax.apply_updates(params, updates)
-    return params, opt_state, loss
-
-# Training
-for epoch in range(epochs):
-    for i in range(0, len(observations), batch_size):
-        batch_obs = observations[i:i+batch_size]
-        batch_act = actions[i:i+batch_size]
-        params, opt_state, loss = train_step(params, opt_state, batch_obs, batch_act)
-    print(f"Epoch {epoch+1}, Loss: {loss}")
-
-#%%
-# Test
-def test_model(params, observation):
-    return imitation_model(params, observation)
-
-# Example usage
-test_obs = observations[0]  # Replace with a real test observation
-predicted_action = test_model(params, test_obs)
-print(f"Predicted Action: {predicted_action}")
-
-
-
-# %%
-# Test the model
-# Setup environment and initialize variables
+# %% 
+# Import necessary libraries and define constants
 from tmrl import get_environment
+from time import sleep
+from jax import random, grad, nn
+import jax.numpy as jnp
+from collections import namedtuple
+import matplotlib.pyplot as plt
+import numpy as np
+import gymnasium as gym
+from gymnasium import spaces
 
+# %%
+# Define constants
+
+ACTION_AMOUNT = 20
+EPISODES = 550
+EPSILON = 0.2
+param_scaling = 0.02
+
+# Helper functions: Flatten nested lists/arrays and initialize model parameters
+def flatten(args):
+    """Flatten nested lists or arrays into a tuple."""
+    try:
+        iter(args)
+        final = []
+        for arg in args:
+            final += flatten(arg)
+        return tuple(final)
+    except TypeError:
+        return (args, )
+
+
+# %%
+import keyboard
+# Key mapping function
+def check_keyboard_input():
+    """Check for WASD key presses and return the corresponding action adjustment."""
+    action_adjustment = jnp.array([0.0, 0.0, 0.0])  # Default: no adjustment
+    if keyboard.is_pressed("w"):
+        action_adjustment = action_adjustment.at[0].set(1.0)  # Increase gas
+    if keyboard.is_pressed("s"):
+        action_adjustment = action_adjustment.at[1].set(1.0)  # Apply brake
+    if keyboard.is_pressed("a"):
+        action_adjustment = action_adjustment.at[2].set(-1.0)  # Steer left
+    if keyboard.is_pressed("d"):
+        action_adjustment = action_adjustment.at[2].set(1.0)  # Steer right
+    return action_adjustment
+
+
+# %% Record run to imitate
+import time
+from threading import Thread, Event
+
+# Initialize the environment and variables
 env = get_environment()
-env.reset()
-rng = random.PRNGKey(43535)
+obs, info = env.reset()
+obs = jnp.asarray(flatten(obs))
+terminated, truncated = False, False
+action_list = []
 
-generated_actions = []
+start_time = time.time()
 
-for i in range(len(observations)):
-    obs = observations[i]
-    act = test_model(params, obs)
+# Event to control the recording thread
+stop_recording = Event()
 
-    act[0] = jnp.clip(act[0], 0.0, 1.0)
-    print(f"{i}: {act}")
-    generated_actions.append(act)
+# Function to record actions with timestamps
+def record_actions(interval=0.05):
+    """Record keyboard actions with timestamps at regular intervals."""
+    while not stop_recording.is_set():
+        action_done = check_keyboard_input()
+        timestamp = time.time() - start_time
+        action_list.append((action_done, timestamp))
+        time.sleep(interval)
 
+# Start the recording thread
+recording_thread = Thread(target=record_actions, args=(0.05,))
+recording_thread.start()
 
-for i in range(1):
-    env.reset()
-    terminated, truncated = False, False
-    counter = 0
-    rng = random.PRNGKey(45 * i)
+# Main environment loop
+try:
     while not (terminated | truncated):
-        print(f"Next action: {generated_actions[counter % len(generated_actions)]}")
-        act = generated_actions[counter % len(generated_actions)]
-        
-        next_obs, rew, terminated, truncated, info = env.step(act)
-        counter += 1
+        next_obs, rew, terminated, truncated, info = env.step(jnp.array([0.0, 0.0, 0.0]))
+        next_obs = jnp.asarray(flatten(next_obs))
+
+        # Check for termination
+        if terminated or truncated:
+            print("Recording complete!")
+            break
+finally:
+    # Stop the recording thread and wait for it to finish
+    stop_recording.set()
+    recording_thread.join()
+
+# Display recorded actions and timestamps
+for action, timestamp in action_list:
+    print(f"Action: {action}, Timestamp: {timestamp}")
+
+
+# %%
+# Find the closest action to a given timestamp
+import bisect
+
+# Function to find the closest timestamp
+def find_closest_action(timestamp, action_list):
+    """
+    Find the closest action to a given timestamp.
+    Uses binary search for efficient lookup.
+    """
+    timestamps = [entry[1] for entry in action_list]  # Extract timestamps
+    idx = bisect.bisect_left(timestamps, timestamp)  # Find insertion position
+
+    # Edge cases: check boundaries
+    if idx == 0:
+        return action_list[0]  # Closest is the first element
+    elif idx == len(timestamps):
+        return action_list[-1]  # Closest is the last element
+
+    # Check neighbors to find the closest timestamp
+    before = action_list[idx - 1]
+    after = action_list[idx]
+    if abs(before[1] - timestamp) <= abs(after[1] - timestamp):
+        return before
+    else:
+        return after
+
+
+# %%
+# Main repeating loop
+obs, info = env.reset()
+terminated, truncated = False, False
+
+# Reset the clock
+start_time = time.time()
+
+# Main loop
+while not (terminated | truncated):
+    # Calculate elapsed time since reset
+    elapsed_time = time.time() - start_time
+
+    # Find the closest action for the current elapsed time
+    closest_action = find_closest_action(elapsed_time, action_list)
+    act = closest_action[0]  # Extract the action part
+
+    next_obs, rew, terminated, truncated, info = env.step(act)
+    next_obs = jnp.asarray(flatten(next_obs))
+    
+    print(f"Time: {elapsed_time:.2f}s, Action: {act}")
+
+    if terminated or truncated:
+        print("End of simulation!")
+        break
