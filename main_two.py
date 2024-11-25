@@ -33,3 +33,4 @@ for _ in range(200):  # rtgym ensures this runs at 20Hz by default
     if terminated or truncated:
         break
 env.wait()  # rtgym-specific method to artificially 'pause' the environment when needed
+# %%

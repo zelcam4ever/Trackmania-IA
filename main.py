@@ -13,12 +13,13 @@ import pickle
 
 # %% Setup replay buffer and environment
 entry = namedtuple("Memory", ["obs", "action", "reward", "next_obs", "done"])
-memory = deque(maxlen=1000)  # Replay buffer
+memory = deque(maxlen=1000000)  # Replay buffer
 gamma = 0.95  # Discount factor
 learning_rate = 0.001
 env = get_environment()
-filename = "params.pkl"
-filenameTarget = "targetParams.pkl"
+filenameCritic = "criticParams.pkl"
+filenameCriticTarget = "criticTargetParams.pkl"
+filenameActor = "actorParams.pkl"
 
 # %% Initialize network parameters
 def initialize_mlp_params(rng, input_size, hidden_sizes, output_size):
@@ -57,9 +58,6 @@ def initialize_mlp_critic_params(rng, input_size, hidden_sizes, output_size):
         params.append(init_layer_params(hidden_sizes[i], hidden_sizes[i + 1], keys[i + 1]))
     # Output layer
     params.append(init_layer_params(hidden_sizes[-1], output_size, keys[-1]))
-    print(params[0])
-    print(params[1])
-    print(params[2])
     return params
 
 def forward_mlp(params, x):
@@ -71,7 +69,7 @@ def forward_mlp(params, x):
     """
     activations = x
     for w, b in params[:-1]:
-        activations = jnp.tanh(jnp.dot(activations, w) + b)  # Hidden layers
+        activations = nn.tanh(jnp.dot(activations, w) + b)  # Hidden layers
 
     final_w, final_b = params[-1]
     output = jnp.dot(activations, final_w) + final_b
@@ -99,7 +97,7 @@ def forward_mlp_critic(params, x, action):
         x = x[None,...]
     activations = jnp.concatenate([x, action], axis=1) 
     for w, b in params[:-1]:
-        activations = jnp.tanh(jnp.dot(activations, w) + b)  # For bounded actions
+        activations = nn.tanh(jnp.dot(activations, w) + b)  # For bounded actions
     final_w, final_b = params[-1]
     return jnp.dot(activations, final_w) + final_b
 
@@ -112,44 +110,58 @@ def huber_loss(x, delta=1.0):
 def compute_l2_regularization(params):
     l2_reg = 0.0
     # Weights are located at indices 1, 3, 5 (0-based indexing)
-    for i in [0, 1, 2]:
+    for i in [len(params)]:
         w, _ = params[i]  # Weights are stored in these indices
         l2_reg += jnp.sum(w ** 2)  # L2 regularization for weights
     return l2_reg
 
-# Loss function for the critic with L2 regularization
-def bellman_loss(critic_params, target_critic_params, actor_params, batch, gamma=0.99, tau=0.005):
+def bellman_loss(
+    critic_params_list,
+    target_critic_params_list,
+    actor_params,
+    batch,
+    gamma=0.99,
+    tau=0.005,
+):
     """
-    Bellman loss for the critic network with L2 regularization.
+    Bellman loss for multiple critics in SAC, returning a loss for each critic.
     """
     # Unpack batch
     obs, actions, rewards, next_obs, dones = batch
 
-    # Predicted Q-values for current state-action pairs
-    q_values = forward_mlp_critic(critic_params, obs, actions)
+    # Compute predicted Q-values from all critics
+    q_values_list = [forward_mlp_critic(params, obs, actions) for params in critic_params_list]
 
     # Predict next actions using the actor (for next state)
     next_actions = get_action_for_inference(actor_params, next_obs)
 
-    # Target Q-values using the target critic and next state-action pairs
-    target_q_values = forward_mlp_critic(target_critic_params, next_obs, next_actions)
+    # Compute target Q-values from all target critics
+    target_q_values_list = [
+        forward_mlp_critic(params, next_obs, next_actions)
+        for params in target_critic_params_list
+    ]
 
-    # Clip target Q-values to prevent them from becoming too large
-    target_q_values = jnp.clip(target_q_values, -1e2, 1e2)
+    # Take the minimum of the target Q-values across all critics (clipped double Q-learning)
+    target_q_values_min = jnp.min(jnp.stack(target_q_values_list, axis=0), axis=0)
+
+    # Clip target Q-values to prevent instability
+    target_q_values_min = jnp.clip(target_q_values_min, -1e2, 1e2)
 
     # Compute the Bellman targets
-    targets = rewards + gamma * target_q_values * (1.0 - dones)
+    targets = rewards + gamma * target_q_values_min * (1.0 - dones)
 
-    # Huber loss for critic loss (more robust to large errors)
-    loss = huber_loss(q_values - targets)
+    # Compute Huber loss for each critic
+    
+    critic_losses = []
+    
+    for q_values in q_values_list:
+        loss = huber_loss(q_values.squeeze() - targets)
+        critic_losses.append(loss)
 
-    # Compute L2 regularization on critic's weights
-    l2_reg = 1e-2 * compute_l2_regularization(critic_params)
 
-    # Total loss with L2 regularization
-    total_loss = loss + l2_reg
+    # Return a list of losses, one for each critic
+    return jnp.mean(jnp.array(critic_losses))
 
-    return total_loss
 
 
 
@@ -179,16 +191,26 @@ def compute_log_probs(mean, log_std, actions):
 
     return log_probs
 
-def policy_loss(actor_params, critic_params, batch, key, alpha = 0.1):
+def policy_loss(actor_params, critic_params_list, batch, key, alpha = 0.1):
     """
-    Policy loss for the actor in SAC with entropy regularization.
+    Policy loss for the actor with entropy regularization, using multiple critics.
+    
+    Arguments:
+    - actor_params: Parameters for the actor network.
+    - critic_params_list: List of parameters for all critics.
+    - batch: Batch of experience (obs, actions, rewards, next_obs, dones).
+    - key: JAX PRNG key for sampling.
+    - alpha: Entropy coefficient.
+    
+    Returns:
+    - Policy loss for the actor.
     """
     # Unpack batch
     obs, _, _, _, _ = batch
 
     # Actor outputs mean and log_std
     mean, log_std = forward_mlp(actor_params, obs)
-    std = jnp.exp(log_std) + 1e-6  # Prevent std from being zero
+    std = jnp.exp(log_std)
 
     # Sample actions using reparametrization trick
     sampled_actions = mean + std * jax.random.normal(key, mean.shape)
@@ -196,14 +218,14 @@ def policy_loss(actor_params, critic_params, batch, key, alpha = 0.1):
     # Compute log probabilities of sampled actions
     log_probs = compute_log_probs(mean, log_std, sampled_actions)
 
-    # Q-values for the sampled actions from the critic
-    q_values = forward_mlp_critic(critic_params, obs, sampled_actions)
+    # Compute Q-values for sampled actions from all critics
+    q_values_list = [forward_mlp_critic(critic_params, obs, sampled_actions) for critic_params in critic_params_list]
 
-    # Advantage calculation (optional but typically included in SAC)
-    advantage = q_values - jnp.mean(q_values)
+    # Average the Q-values from all critics
+    avg_q_values = jnp.mean(jnp.stack(q_values_list, axis=0), axis=0)
 
     # Policy loss: maximize Q-values and entropy (minimize negative Q-values and log_probs)
-    policy_loss = jnp.mean(alpha * log_probs - advantage)
+    policy_loss = jnp.mean(alpha * log_probs - avg_q_values)
 
     return policy_loss
 
@@ -243,18 +265,40 @@ def policy_fn(params, rng, obs, epsilon=0.1):
 
 # Training step with gradient descent
 @jit
-def update_actor(actor_params, critic_params, opt_state, batch, key):
-    loss, gradients = jax.value_and_grad(policy_loss)(actor_params, critic_params, batch, key)
+def update_actor(actor_params, critic_params_list, opt_state, batch, key):
+    loss, gradients = jax.value_and_grad(policy_loss)(actor_params, critic_params_list, batch, key)
     updates, opt_state = actor_optimizer.update(gradients, opt_state, actor_params)
     actor_params = optax.apply_updates(actor_params, updates)
     return actor_params, opt_state, loss
 
 @jit
-def update_critic(critic_params, target_critic_params, actor_params, opt_state, batch):
-    loss, gradients = jax.value_and_grad(bellman_loss)(critic_params, target_critic_params, actor_params, batch)
-    updates, opt_state = actor_optimizer.update(gradients, opt_state, critic_params)
-    critic_params = optax.apply_updates(critic_params, updates)
-    return critic_params, opt_state, loss
+def update_critic(critic_params_list, target_critic_params_list, actor_params, opt_state_critic_list, batch, tau = 0.005):
+    # Update critics
+    updated_critic_params_list = []
+    updated_opt_state_critic_list = []
+    loss, gradients = jax.value_and_grad(bellman_loss)(
+        critic_params_list, target_critic_params_list, actor_params, batch
+    )
+    for i, (critic_params, critic_opt_state, critic_grads) in enumerate(zip(
+        critic_params_list, opt_state_critic_list, gradients)):
+        
+        # Apply gradient to update the critic parameters
+        updates, new_opt_state = critic_optimizer.update(critic_grads, critic_opt_state, critic_params)
+        updated_critic_params = optax.apply_updates(critic_params, updates)
+        
+        # Append updated parameters and opt state for each critic
+        updated_critic_params_list.append(updated_critic_params)
+        updated_opt_state_critic_list.append(new_opt_state)
+
+    # Update target critics
+    updated_target_critic_params_list = update_target_critic_networks(updated_critic_params_list, target_critic_params_list, tau)
+
+    return (
+        updated_critic_params_list,
+        updated_opt_state_critic_list,
+        loss,  # total loss of critics
+        updated_target_critic_params_list
+    )
 
 # Sampling from memory
 def sample_batch(rng, memory, batch_size):
@@ -274,26 +318,68 @@ def preprocess_obs(obs):
     processed_obs = jnp.concatenate([speed, lidar, prev_actions, prev_actions_2])
     return processed_obs
 
-# Soft update of target network
-def update_target_network(params, target_params, tau=0.05):
-    return tree_util.tree_map(lambda p, tp: tau * p + (1 - tau) * tp, params, target_params)
+def update_target_critic_networks(critic_params_list, target_critic_params_list, tau=0.005):
+    """
+    Soft update for all critic target networks.
+    
+    Arguments:
+    - critic_params_list: List of parameters for all critics.
+    - target_critic_params_list: List of parameters for all target critics.
+    - tau: Soft update coefficient.
+    
+    Returns:
+    - Updated target critic parameters list.
+    """
+    updated_target_critic_params_list = []
+
+    for critic_params, target_critic_params in zip(critic_params_list, target_critic_params_list):
+        # Perform soft update for each layer in the critic's parameter list
+        updated_target_critic_params = [
+            (tau * w + (1 - tau) * tw, tau * b + (1 - tau) * tb)
+            for (w, b), (tw, tb) in zip(critic_params, target_critic_params)
+        ]
+        updated_target_critic_params_list.append(updated_target_critic_params)
+    
+    return updated_target_critic_params_list
 
 
 # %%
 # Main training loop
 rng = random.PRNGKey(0)
 input_size = 83  # Based on Trackmania observations (flattened)
-hidden_sizes = [128, 64]
+hidden_sizes = [256, 256, 128]
 output_size = 6
 actor_params = initialize_mlp_params(rng, input_size, hidden_sizes, output_size)
-critic_params = initialize_mlp_critic_params(rng, input_size + 3, hidden_sizes, 1)
-target_critic_params = critic_params.copy()
 
 # Set up optimizer
-actor_optimizer = optax.adam(learning_rate * 0.1)
+actor_optimizer = optax.adam(learning_rate)
 actor_opt_state = actor_optimizer.init(actor_params)
+
+# Variable for the number of critics
+num_critics = 10  # Change this value as needed
+
+# Initialize a single optimizer
 critic_optimizer = optax.adam(learning_rate)
-critic_opt_state = critic_optimizer.init(critic_params)
+
+# Initialize lists to hold parameters, target parameters, and optimizer states
+critic_params_list = []
+target_critic_params_list = []
+critic_opt_state_list = []
+
+# Loop to initialize each critic's parameters and optimizer state
+for i in range(num_critics):
+    # Initialize critic parameters
+    critic_params = initialize_mlp_critic_params(rng, input_size + 3, hidden_sizes, 1)
+    target_critic_params = critic_params.copy()
+
+    # Initialize optimizer state for each critic
+    critic_opt_state = critic_optimizer.init(critic_params)
+
+    # Append to lists
+    critic_params_list.append(critic_params)
+    target_critic_params_list.append(target_critic_params)
+    critic_opt_state_list.append(critic_opt_state)
+
 rewards = []
 highestReward = 0
 
@@ -318,7 +404,9 @@ highestReward = 0
 
 # %%
 
-for episode in range(200):  # rtgym ensures this runs at 20Hz by default
+memory.clear()
+
+for episode in range(10):  # rtgym ensures this runs at 20Hz by default
     obs, info = env.reset()
     total_reward = 0
     obs = preprocess_obs(obs)
@@ -326,11 +414,14 @@ for episode in range(200):  # rtgym ensures this runs at 20Hz by default
     terminated = False
     truncated = False
     first = True
+    actor_loss = 0
+    critic_loss = 0
     print(f"Episode: {episode}")
     while not (terminated | truncated):
         t += 1
         rng, key = random.split(rng)
-        epsilon = max(0.1, 1.0 - episode / 200)
+        #epsilon = max(0.1, 1.0 - episode / 100)
+        epsilon = 0
         action = policy_fn(actor_params, key, obs, epsilon)
 
         #action = action.at[0].set(1)
@@ -348,12 +439,12 @@ for episode in range(200):  # rtgym ensures this runs at 20Hz by default
         total_reward += reward
         obs = next_obs
         
-        if len(memory) >= 64 and t % 4 == 0:
+        if len(memory) >= 1000 and t % 4 == 0:
             rngs = random.split(rng, 3)
-            batch = sample_batch(rngs[0], memory, 64)
-            critic_params, critic_opt_state, critic_loss = update_critic(critic_params, target_critic_params, actor_params, critic_opt_state, batch)
-            actor_params, actor_opt_state, actor_loss = update_actor(actor_params, critic_params, actor_opt_state, batch, rngs[1])
-            target_critic_params = update_target_network(critic_params, target_critic_params)
+            batch = sample_batch(rngs[0], memory, 256)
+            critic_params_list, critic_opt_state_list, critic_loss, target_critic_params_list = update_critic(critic_params_list, target_critic_params_list, actor_params, critic_opt_state_list, batch)
+            if t % 80 == 0:
+                actor_params, actor_opt_state, actor_loss = update_actor(actor_params, critic_params_list, actor_opt_state, batch, rngs[1])
 
         if done:
             rngs = random.split(rng, 3)
@@ -365,13 +456,13 @@ for episode in range(200):  # rtgym ensures this runs at 20Hz by default
             rewards.append(total_reward)
             if(highestReward < total_reward):
                     best_actor_params = actor_params.copy()
-                    best_critic_params = critic_params.copy()
-                    best_target_critic_params = target_critic_params.copy()
+                    best_critic_params_list = critic_params_list.copy()
+                    best_target_critic_params_list = target_critic_params_list.copy()
                     highestReward = total_reward
                     print("New record:" , highestReward)
             print(f"Critic Loss: {critic_loss:.6f}")
             print(f"Actor Loss: {actor_loss:.6f}")
-            q_value = forward_mlp_critic(critic_params, obs, action)
+            q_value = forward_mlp_critic(critic_params_list[0], obs, action)
             print(f"Reward: {reward}, Q-values: {q_value}")
             print(f"Action: {action}")
             model_action = get_action_for_inference(actor_params, obs)
@@ -386,23 +477,36 @@ plt.ylabel('Total Reward')
 plt.title('Training Progress')
 plt.show()
 # %% -------------------  Params Saver -------------------
-# import pickle
-# with open(filename, 'wb') as f:
-#     pickle.dump(best_params, f)
-# with open(filenameTarget, 'wb') as f:
-#     pickle.dump(best_target_params, f)
+with open(filenameCritic, 'wb') as f:
+    pickle.dump(critic_params_list, f)
+with open(filenameCriticTarget, 'wb') as f:
+    pickle.dump(target_critic_params_list, f)
+with open(filenameActor, 'wb') as f:
+    pickle.dump(actor_params, f)
 
-# # %% ------------------- Params Loader -------------------
-# with open(filename, 'rb') as f:
-#     loaded_params = pickle.load(f)
-# with open(filenameTarget, 'rb') as f:
-#     loaded_target_params = pickle.load(f)
-
-# # %%
-# params = loaded_params
-# target_params = loaded_target_params
+# %% ------------------- Params Loader -------------------
+with open(filenameCritic, 'rb') as f:
+     loaded_critic_params = pickle.load(f)
+with open(filenameCriticTarget, 'rb') as f:
+     loaded_critic_target_params = pickle.load(f)
+with open(filenameActor, 'rb') as f:
+     loaded_actor_params = pickle.load(f)   
 
 # %% use best params
-critic_params = best_critic_params
-target_critic_params = best_target_critic_params
+critic_params = best_critic_params_list
+target_critic_params = best_target_critic_params_list
 actor_params = best_actor_params
+
+
+# %%
+critic_params_list = loaded_critic_params
+target_critic_params_list = loaded_critic_target_params
+actor_params = loaded_actor_params
+# %% Clear memory
+
+memory.clear()
+
+# %%
+filenameCritic = "criticParams.pkl"
+filenameCriticTarget = "criticTargetParams.pkl"
+filenameActor = "actorParams.pkl"
