@@ -197,7 +197,7 @@ def preprocess_obs(obs):
     """
     grayscale_images = obs[3]
     grayscale_images = grayscale_images.astype(np.float32) / 256.0
-    obs_data = jnp.concatenate([obs[0], obs[1], obs[2]], axis=0)
+    obs_data = jnp.concatenate([obs[0].flatten(), obs[1].flatten(), obs[2].flatten(), obs[4].flatten(), obs[5].flatten()], axis=0)
     return obs_data, grayscale_images
 
 # Soft update of target network
