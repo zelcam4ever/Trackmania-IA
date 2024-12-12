@@ -72,6 +72,7 @@ class CustomEnvWrapper(gym.Wrapper):
 env = get_environment()
 wrapped_env = CustomEnvWrapper(env)
 
+# %%
 
 model = SAC("MlpPolicy", wrapped_env, verbose=1) 
 

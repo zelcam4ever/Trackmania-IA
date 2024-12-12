@@ -113,7 +113,7 @@ wrapped_env = CustomEnvWrapper(env, cnn_head)
 model = SAC("MlpPolicy", wrapped_env, verbose=1) 
 
 #%%
-model.learn(total_timesteps=30_000, progress_bar=True)
+model.learn(total_timesteps=300_000, progress_bar=True)
 
 # %%
 vec_env = model.get_env()
