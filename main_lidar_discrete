@@ -157,8 +157,8 @@ def preprocess_obs(obs):
     processed_obs = jnp.concatenate([speed, lidar, prev_actions, prev_actions_2])
     return processed_obs
 
-def update_target_network(params, target_params, tau = 0.005):
-    return jax.tree_util.tree_map(lambda p, tp: tau * p + (1 - tau) * tp, params, target_params)
+def soft_update(target_params, source_params, polyak=0.995):
+    return jax.tree_util.tree_map(lambda t, s: polyak * t + (1 - polyak) * s, target_params, source_params)
 
 
 import numpy as np
@@ -239,24 +239,6 @@ max_lidar = 70
 last_completed_params = actor_params.copy
 last_completed_target_params = target_actor_params.copy
 
-# # %%
-# obs, info = env.reset()
-# total_reward = 0
-
-# # Print the observation structure to understand it better
-# print("Observation structure:", type(obs), "Content:", obs)
-
-# # If obs is a dictionary or has nested components, handle accordingly:
-# if isinstance(obs, dict):
-#     # Assuming the actual observation is in a key like 'observation' (adjust as per env)
-#     obs_array = jnp.asarray(obs.get("observation", obs)).flatten()
-# elif isinstance(obs, (tuple, list)):
-#     # If obs is a tuple or list, access a specific part that’s the main observation
-#     obs_array = jnp.asarray(obs[0]).flatten()
-# else:
-#     # If obs is already an array-like structure, directly flatten it
-#     obs_array = jnp.asarray(obs).flatten()
-
 # %%
 
 memory.clear()
@@ -271,6 +253,7 @@ for episode in range(101):  # rtgym ensures this runs at 20Hz by default
     loss = 0
     print(f"Episode: {episode}")
     if episode % 10 == 0 and episode != 0:
+        # Save bets params
         with open(filename, 'wb') as f:
             pickle.dump(best_actor_params, f)
         with open(filenameTarget, 'wb') as f:
@@ -291,11 +274,7 @@ for episode in range(101):  # rtgym ensures this runs at 20Hz by default
     while not (terminated | truncated):
         t += 1
         rng, key = random.split(rng)
-        #epsilon = max(0.1, 1.0 - episode / 1000)
-        #if(len(memory) >= 1000):
-        epsilon = 0
-        #else:
-        #    epsilon = 1   
+        epsilon = max(0.1, 1.0 - episode / 1000)
         action = policy_fn(actor_params, key, obs, epsilon)
         game_action = map_action(action)
         
@@ -307,10 +286,9 @@ for episode in range(101):  # rtgym ensures this runs at 20Hz by default
         if reward >= 100:
             last_completed_params = actor_params.copy()
             last_completed_target_params = target_actor_params.copy()
-        #print(reward)
+
         # Store transition in replay buffer
-        if t > 20:
-            memory.append(entry(obs, action, reward, next_obs, done))
+        memory.append(entry(obs, action, reward, next_obs, done))
         total_reward += reward
         obs = next_obs
 
@@ -322,11 +300,12 @@ for episode in range(101):  # rtgym ensures this runs at 20Hz by default
                     highestReward = total_reward
                     print("New record:" , highestReward)
             if len(memory) >= 1000:
+                #Train if more than 1000 samples collected.
                 for i in range(100):
                     rngs = random.split(rng, 3)
                     batch = sample_batch(rngs[0], memory, 256)
                     actor_params, actor_opt_state, loss = update_actor(actor_params, target_actor_params, actor_opt_state, batch)
-                    target_actor_params = update_target_network(actor_params, target_actor_params)
+                    target_actor_params = soft_update(target_actor_params, actor_params)
                 print(f"Loss: {loss:.6f}")
                 print(f"q_values:", forward_mlp_actor(actor_params, obs))
                 model_action = convert_action(forward_mlp_actor(actor_params, obs))
@@ -341,7 +320,7 @@ for i in range(10000):
     rngs = random.split(rng, 3)
     batch = sample_batch(rngs[0], memory, 256)
     actor_params, actor_opt_state, loss = update_actor(actor_params, target_actor_params, actor_opt_state, batch)
-    target_actor_params = update_target_network(actor_params, target_actor_params)
+    target_actor_params = soft_update(target_actor_params, actor_params)
 
 print(f"Loss: {loss:.6f}")
 print(f"q_values:", forward_mlp_actor(actor_params, obs))

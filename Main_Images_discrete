@@ -168,12 +168,12 @@ def preprocess_obs(obs):
     Preprocessor for TM2020 with images, converting images back to uint8
     """
     grayscale_images = obs[3]
-    grayscale_images = grayscale_images.astype(np.float32) / 256.0
+    grayscale_images = grayscale_images.astype(np.float32) / 255.0 #Normalize image
     obs_data = jnp.concatenate([obs[0].flatten() / 1000.0, obs[1].flatten() / 10.0, obs[2].flatten() / 10000.0, obs[4].flatten(), obs[5].flatten()], axis=0)
     return obs_data, grayscale_images
 
-def update_target_network(params, target_params, tau = 0.995):
-    return jax.tree_util.tree_map(lambda p, tp: tau * p + (1 - tau) * tp, params, target_params)
+def soft_update(target_params, source_params, polyak=0.995):
+    return jax.tree_util.tree_map(lambda t, s: polyak * t + (1 - polyak) * s, target_params, source_params)
 
 
 import numpy as np
@@ -285,6 +285,7 @@ for episode in range(501):  # rtgym ensures this runs at 20Hz by default
     loss = 0
     print(f"Episode: {episode}")
     if episode % 10 == 0 and episode != 0:
+        #Save best params
         with open(filename, 'wb') as f:
             pickle.dump(actor_params, f)
         with open(filenameTarget, 'wb') as f:
@@ -306,11 +307,6 @@ for episode in range(501):  # rtgym ensures this runs at 20Hz by default
         t += 1
         rng, key = random.split(rng)
         epsilon = max(0.0, 1.0 - episode / 450)
-        #if(len(memory) >= 1000):
-        #    epsilon = 0
-        #else:
-        #    epsilon = 1
-        #epsilon = 0
         action = policy_fn(actor_params, key, obs_data, obs_images, epsilon)
         game_action = map_action(action)
         
@@ -322,10 +318,8 @@ for episode in range(501):  # rtgym ensures this runs at 20Hz by default
         if reward >= 100:
             last_completed_params = actor_params.copy()
             last_completed_target_params = target_actor_params.copy()
-        #print(reward)
         # Store transition in replay buffer
-        if t > 20:
-            memory.append(entry(obs_data, obs_images, action, reward, next_obs_data, next_obs_images, done))
+        memory.append(entry(obs_data, obs_images, action, reward, next_obs_data, next_obs_images, done))
         total_reward += reward
         obs_data, obs_images = next_obs_data, next_obs_images
 
@@ -337,11 +331,12 @@ for episode in range(501):  # rtgym ensures this runs at 20Hz by default
                     highestReward = total_reward
                     print("New record:" , highestReward)
             if len(memory) >= 1000:
+                #Train if more than 1000 samples collected.
                 for i in range(10):
                     rngs = random.split(rng, 3)
                     batch = sample_batch(rngs[0], memory, 256)
                     actor_params, actor_opt_state, loss = update_actor(actor_params, target_actor_params, actor_opt_state, batch)
-                    target_actor_params = update_target_network(actor_params, target_actor_params)
+                    target_actor_params = soft_update(target_actor_params, actor_params)
                 print(f"Loss: {loss:.6f}")
                 print(f"q_values:", forward_mlp_actor(actor_params, obs_data, obs_images))
                 model_action = convert_action(forward_mlp_actor(actor_params, obs_data, obs_images)[0])
@@ -356,7 +351,7 @@ for i in range(10000):
     rngs = random.split(rng, 3)
     batch = sample_batch(rngs[0], memory, 256)
     actor_params, actor_opt_state, loss = update_actor(actor_params, target_actor_params, actor_opt_state, batch)
-    target_actor_params = update_target_network(actor_params, target_actor_params)
+    target_actor_params = soft_update(target_actor_params, actor_params)
 
 print(f"Loss: {loss:.6f}")
 print(f"q_values:", forward_mlp_actor(actor_params, obs))

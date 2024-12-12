@@ -102,9 +102,11 @@ class CustomEnvWrapper(gym.Wrapper):
 
 # %%
 
+# Setup the CNN Head
 cnn_model = mobilenet_v3_small(weights=MobileNet_V3_Small_Weights.DEFAULT)
 cnn_head = nn.Sequential(*list(cnn_model.features), nn.AdaptiveAvgPool2d((1, 1)))
 
+# Wrap Environment 
 env = get_environment()
 wrapped_env = CustomEnvWrapper(env, cnn_head)
 
@@ -115,7 +117,7 @@ model = SAC("MlpPolicy", wrapped_env, verbose=1)
 #%%
 model.learn(total_timesteps=300_000, progress_bar=True)
 
-# %%
+# %% # %% Test the model using deterministic policy
 vec_env = model.get_env()
 
 for episode in range(1):  # rtgym ensures this runs at 20Hz by default

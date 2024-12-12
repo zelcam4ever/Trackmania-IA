@@ -179,8 +179,9 @@ def policy_forward(params, obs, key, test=False, compute_logprob=True, act_limit
 
 # Loss functions 
 
-def critic_loss_fn(Q_params, policy_params ,Q1_target_params, Q2_target_params, batch, key, alpha, gamma = 0.99):
+def critic_loss_fn(Q_params, policy_params ,Q1_target_params, Q2_target_params, batch, key, log_alpha, gamma = 0.99):
     """Q-function loss."""
+    alpha = jnp.exp(log_alpha)
     obs, action, reward, next_obs, done = batch
     q1_value = forward(Q_params[0], obs, action)
     q2_value = forward(Q_params[1], obs, action)
@@ -203,7 +204,8 @@ def critic_loss_fn(Q_params, policy_params ,Q1_target_params, Q2_target_params, 
     
     return loss
 
-def policy_loss_fn(policy_params, Q1_params, Q2_params, batch, rng, alpha):
+def policy_loss_fn(policy_params, Q1_params, Q2_params, batch, rng, log_alpha):
+    alpha = jnp.exp(log_alpha)
     rng, key = random.split(rng)
     obs, _, _, _, _ = batch
     
@@ -229,9 +231,9 @@ def entropy_loss_fn(log_alpha, policy_params, target_entropy, batch, key):
 
 # Training step with gradient descent
 @jit
-def update_actor(params, Q1_params, Q2_params, opt_state, batch, key, alpha):
+def update_actor(params, Q1_params, Q2_params, opt_state, batch, key, log_alpha):
     policy_loss = partial(policy_loss_fn, Q1_params=Q1_params, Q2_params=Q2_params, 
-                          batch=batch, rng=key, alpha=alpha)
+                          batch=batch, rng=key, log_alpha=log_alpha)
     loss, gradients = jax.value_and_grad(policy_loss)(params)
     updates, opt_state = opt_actor.update(gradients, opt_state, params)
     params = optax.apply_updates(params, updates)
@@ -239,11 +241,11 @@ def update_actor(params, Q1_params, Q2_params, opt_state, batch, key, alpha):
 
 
 @jit
-def update_critic(Q_params, policy_params, Q1_target_params, Q2_target_params, opt_state, batch, key, alpha):
+def update_critic(Q_params, policy_params, Q1_target_params, Q2_target_params, opt_state, batch, key, log_alpha):
     
     # Define the loss function
     q_loss = partial(critic_loss_fn, policy_params=policy_params, Q1_target_params=Q1_target_params, 
-                     Q2_target_params=Q2_target_params, batch=batch, key=key, alpha=alpha)
+                     Q2_target_params=Q2_target_params, batch=batch, key=key, log_alpha=log_alpha)
     
     # Compute gradients
     loss, gradients = jax.value_and_grad(q_loss)(Q_params)
@@ -308,7 +310,7 @@ Q2_params = initialize_mlp_params(rngs[1], obs_dim + action_dim, hidden_dim, 1)
 Q1_target_params = Q1_params.copy()
 Q2_target_params = Q2_params.copy()
 policy_params = initialize_mlp_params(rngs[2], obs_dim, hidden_dim, action_dim * 2)
-#log_alpha = -1.6
+log_alpha = 0
 
 # Optimizers
 # Define a gradient clipping optimizer
@@ -322,11 +324,11 @@ def create_clipped_optimizer(learning_rate, max_norm):
 # Optimizers
 opt_actor = create_clipped_optimizer(lr_actor, max_norm=1.0)
 opt_critic = create_clipped_optimizer(lr_critic, max_norm=1.0)
-#opt_alpha = create_clipped_optimizer(lr_entropy, max_norm=1.0)
+opt_alpha = create_clipped_optimizer(lr_entropy, max_norm=1.0)
 Q_params = (Q1_params, Q2_params)
 Q_opt_state = opt_critic.init(Q_params)
 policy_opt_state = opt_actor.init(policy_params)
-#alpha_opt_state = opt_alpha.init(log_alpha)
+alpha_opt_state = opt_alpha.init(log_alpha)
 
 
 replay_buffer = ReplayBuffer(replay_buffer_size, obs_dim, action_dim)
@@ -357,8 +359,6 @@ for episode in range(episodes):
             pickle.dump(best_q1_target_params, f)
         with open(filename_q2_target, 'wb') as f:
             pickle.dump(best_q2_target_params, f)
-        #with open(filename_entropy, 'wb') as f:
-        #    pickle.dump(best_log_alpha, f)
         with open(current_filename_q, 'wb') as f:
             pickle.dump(Q_params, f)
         with open(current_filename_policy, 'wb') as f:
@@ -367,16 +367,11 @@ for episode in range(episodes):
             pickle.dump(Q1_target_params, f)
         with open(current_filename_q2_target, 'wb') as f:
             pickle.dump(Q2_target_params, f)
-        #with open(current_filename_entropy, 'wb') as f:
-        #    pickle.dump(log_alpha, f)
 
     while not done:
         total_steps += 1
         rng, subkey = random.split(rng)
-        #prev_actio = action
         action, _ = policy_forward(policy_params, obs, subkey, test=False, compute_logprob=False)
-        #if total_steps % 4 != 0:
-        #    action = action.at[2].set(prev_actio[2])
         game_action = convert_to_game_action(action, jnp.array([0.5, 0.5, 1.0]))
         next_obs, reward, terminated, truncated, info = env.step(game_action)
         done = terminated or truncated
@@ -386,14 +381,15 @@ for episode in range(episodes):
         episode_reward += reward
         
         if replay_buffer.size() > batch_size:
+            #train if more samples are gathered than the size od the batch
             rngs = random.split(rng, 7)
             batch = replay_buffer.sample(batch_size)
             
-            Q_params, Q_opt_state, loss_q = update_critic(Q_params, policy_params, Q1_target_params, Q2_target_params, Q_opt_state, batch, rngs[3], alpha)
+            Q_params, Q_opt_state, loss_q = update_critic(Q_params, policy_params, Q1_target_params, Q2_target_params, Q_opt_state, batch, rngs[3], log_alpha)
             
-            policy_params, policy_opt_state, loss_policy = update_actor(policy_params, Q1_params, Q2_params, policy_opt_state, batch, rngs[5], alpha)
+            policy_params, policy_opt_state, loss_policy = update_actor(policy_params, Q1_params, Q2_params, policy_opt_state, batch, rngs[5], log_alpha)
 
-            #log_alpha, alpha_opt_state, loss_entropy = update_entropy(log_alpha, policy_params, alpha_opt_state, target_entropy, batch, rngs[2])
+            log_alpha, alpha_opt_state, loss_entropy = update_entropy(log_alpha, policy_params, alpha_opt_state, target_entropy, batch, rngs[2])
             
             Q1_target_params = soft_update(Q1_target_params, Q1_params)
             Q2_target_params = soft_update(Q2_target_params, Q2_params)
@@ -405,7 +401,6 @@ for episode in range(episodes):
                 best_policy_params = policy_params
                 best_q1_target_params = Q1_target_params
                 best_q2_target_params = Q2_target_params
-                #best_log_alpha = log_alpha
                 highestReward = episode_reward
                 print("New record:" , highestReward)
                 
@@ -414,6 +409,7 @@ for episode in range(episodes):
     avg_rewards.append(np.mean(episode_rewards[-100:]))
     
     if episode % 10 == 0 and episode != 0:
+        #print information every 10 episode
         print(f"--- Episode {episode} Summary ---")
         print(f"Reward:             {episode_reward:.2f}")
         print(f"Average Reward:     {np.mean(avg_rewards[-100:]):.2f}")
@@ -421,10 +417,10 @@ for episode in range(episodes):
         print(f"Episode Length (mean): {total_steps / episode:.2f}")
         print(f"Loss (Critic):      {loss_q:.6f}")
         print(f"Loss (Policy):      {loss_policy:.6f}")
-        #print(f"Entropy Coefficient: {jnp.exp(log_alpha):.4f}")
         print("-" * 30)
     
     if episode % 50 == 0 and episode != 0:
+        #plot graph every 50 episodes
             plt.plot(avg_rewards)
             plt.title("Training Progress")
             plt.xlabel("Episodes")
@@ -432,7 +428,7 @@ for episode in range(episodes):
             plt.show()
 
 
-# %%
+# %% load saved "best params"
 
 with open(filename_q, 'rb') as f:
     loaded_q_params = pickle.load(f)
@@ -442,22 +438,18 @@ with open(filename_q1_target, 'rb') as f:
     loaded_q1_target_params = pickle.load(f)
 with open(filename_q2_target, 'rb') as f:
     loaded_q2_target_params = pickle.load(f)
-with open(filename_entropy, 'rb') as f:
-    loaded_entropy_params = pickle.load(f)
     
-# %%
+# %% Set params to the loaded params and init opt_state
 Q_params = loaded_q_params
 policy_params = loaded_policy_params
 Q1_target_params = loaded_q1_target_params
 Q2_target_params = loaded_q2_target_params
 Q1_params, Q2_params = Q_params
-log_alpha = loaded_entropy_params
 critic1_opt_state = opt_critic.init(Q1_params)
 critic2_opt_state = opt_critic.init(Q2_params)
 policy_opt_state = opt_actor.init(policy_params)
-alpha_opt_state = opt_alpha.init(log_alpha)
 
-# %%
+# %% Load saved "current params"
 with open(current_filename_q, 'rb') as f:
     loaded_q_params = pickle.load(f)
 with open(current_filename_policy, 'rb') as f:
@@ -466,7 +458,5 @@ with open(current_filename_q1_target, 'rb') as f:
     loaded_q1_target_params = pickle.load(f)
 with open(current_filename_q2_target, 'rb') as f:
     loaded_q2_target_params = pickle.load(f)
-with open(current_filename_entropy, 'rb') as f:
-    loaded_entropy_params = pickle.load(f)
 
 # %%

@@ -79,7 +79,7 @@ model = SAC("MlpPolicy", wrapped_env, verbose=1)
 #%%
 model.learn(total_timesteps=30_000, progress_bar=True)
 
-# %%
+# %% Test the model using deterministic policy
 vec_env = model.get_env()
 
 for episode in range(1):  # rtgym ensures this runs at 20Hz by default
